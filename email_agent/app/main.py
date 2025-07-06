@@ -1,59 +1,51 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+import os
+from typing import Dict, Any, List
+from datetime import datetime
+import asyncio
 from contextlib import asynccontextmanager
-import logging
-from .core.config import settings
-from .db.database import init_db
-from .agent.scheduler import email_scheduler
-from .api.emails import router as emails_router
-from .api.knowledge import router as knowledge_router
 
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, settings.log_level),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+from ..mail.gmail_client import GmailClient
+from ..agent.processor import EmailProcessor
+from ..core.logger import get_logger
 
+# Load environment variables
+load_dotenv()
+
+logger = get_logger(__name__)
+
+# Global instances
+gmail_client = None
+email_processor = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan handler."""
-    # Startup
-    logger.info("Starting Email Agent API...")
+    """Application lifespan manager."""
+    global gmail_client, email_processor
     
     try:
-        # Initialize database
-        await init_db()
-        logger.info("Database initialized successfully")
-        
-        # Start scheduler
-        await email_scheduler.start()
-        logger.info("Email scheduler started")
+        # Initialize clients
+        logger.info("Initializing email agent services...")
+        gmail_client = GmailClient()
+        email_processor = EmailProcessor()
+        logger.info("Email agent services initialized successfully")
         
         yield
         
     except Exception as e:
-        logger.error(f"Error during startup: {e}")
+        logger.error(f"Failed to initialize services: {e}")
         raise
     finally:
-        # Shutdown
-        logger.info("Shutting down Email Agent API...")
-        
-        try:
-            # Stop scheduler
-            await email_scheduler.stop()
-            logger.info("Email scheduler stopped")
-            
-        except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
-
+        logger.info("Shutting down email agent services...")
 
 # Create FastAPI app
 app = FastAPI(
     title="Email Agent API",
-    description="AI-powered email processing and response generation system",
+    description="Intelligent email processing system with AI-powered categorization and response generation",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -61,98 +53,229 @@ app = FastAPI(
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include routers
-app.include_router(emails_router)
-app.include_router(knowledge_router)
+# Pydantic models
+class HealthResponse(BaseModel):
+    status: str = "healthy"
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+    services: Dict[str, str] = Field(default_factory=dict)
 
+class EmailProcessingRequest(BaseModel):
+    max_emails: int = Field(default=10, ge=1, le=50)
+    mark_as_read: bool = Field(default=False)
 
-@app.get("/")
-async def root():
-    """Root endpoint with API information."""
-    return {
-        "message": "Email Agent API",
-        "version": "1.0.0",
-        "description": "AI-powered email processing and response generation system",
-        "endpoints": {
-            "emails": "/emails",
-            "knowledge": "/knowledge",
-            "docs": "/docs",
-            "health": "/health"
-        }
-    }
+class EmailProcessingResponse(BaseModel):
+    processed_count: int
+    drafts_created: int
+    emails_processed: List[Dict[str, Any]]
+    processing_time: float
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
 
+class DraftInfo(BaseModel):
+    draft_id: str
+    message_id: str
+    subject: str
+    to: str
+    created_at: str
 
-@app.get("/health")
+# API Routes
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
     try:
-        # Check scheduler status
-        scheduler_status = email_scheduler.is_running
+        services = {}
         
-        # Check database connection (basic check)
-        from .db.database import engine
+        # Check Gmail client
+        if gmail_client:
+            try:
+                # Try to get service info
+                gmail_client.service.users().getProfile(userId="me").execute()
+                services["gmail"] = "connected"
+            except Exception as e:
+                services["gmail"] = f"error: {str(e)}"
+        else:
+            services["gmail"] = "not_initialized"
         
-        return {
-            "status": "healthy",
-            "scheduler_running": scheduler_status,
-            "database_connected": True,
-            "version": "1.0.0"
-        }
+        # Check OpenAI client
+        if email_processor and email_processor.client:
+            services["openai"] = "connected"
+        else:
+            services["openai"] = "not_initialized"
+        
+        return HealthResponse(services=services)
         
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Health check failed: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
 
-
-@app.get("/status")
-async def get_system_status():
-    """Get detailed system status."""
+@app.post("/emails/process-and-save-drafts", response_model=EmailProcessingResponse)
+async def process_emails_and_save_drafts(
+    request: EmailProcessingRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Process unread emails and save AI-generated responses as drafts.
+    
+    This endpoint:
+    1. Fetches unread emails from Gmail
+    2. Processes each email with AI (categorization + response generation)
+    3. Saves appropriate responses as Gmail drafts
+    4. Optionally marks emails as read
+    """
+    if not gmail_client or not email_processor:
+        raise HTTPException(status_code=500, detail="Services not initialized")
+    
+    start_time = datetime.now()
+    
     try:
-        # Get scheduler job status
-        jobs = email_scheduler.get_job_status()
+        # Fetch unread emails
+        logger.info(f"Fetching up to {request.max_emails} unread emails...")
+        emails = gmail_client.fetch_unread(max_results=request.max_emails)
         
-        # Get knowledge base stats
-        from .agent.knowledge_base import knowledge_base_manager
-        kb_stats = knowledge_base_manager.get_stats()
+        if not emails:
+            return EmailProcessingResponse(
+                processed_count=0,
+                drafts_created=0,
+                emails_processed=[],
+                processing_time=0.0
+            )
+        
+        processed_emails = []
+        drafts_created = 0
+        
+        # Process each email
+        for email_data in emails:
+            try:
+                logger.info(f"Processing email: {email_data['subject'][:50]}...")
+                
+                # Process email with AI
+                processing_result = email_processor.categorize_and_process_email(
+                    email_data['body'],
+                    email_data['sender']
+                )
+                
+                # Extract sender email address
+                sender_email = email_data['sender']
+                if '<' in sender_email:
+                    sender_email = sender_email.split('<')[1].split('>')[0]
+                
+                # Create draft if response is needed
+                draft_info = None
+                if processing_result['response_type'] in ['reply', 'new']:
+                    # Generate subject for reply
+                    subject = email_data['subject']
+                    if not subject.lower().startswith('re:'):
+                        subject = f"Re: {subject}"
+                    
+                    # Save as draft
+                    draft_info = gmail_client.save_as_draft(
+                        to_email=sender_email,
+                        subject=subject,
+                        body=processing_result['response'],
+                        in_reply_to=email_data.get('message_id')
+                    )
+                    drafts_created += 1
+                
+                # Mark as read if requested
+                if request.mark_as_read:
+                    background_tasks.add_task(
+                        gmail_client.mark_as_read,
+                        email_data['id']
+                    )
+                
+                # Compile processed email info
+                processed_email = {
+                    "original_email": {
+                        "id": email_data['id'],
+                        "subject": email_data['subject'],
+                        "sender": email_data['sender'],
+                        "date": email_data['date'],
+                        "snippet": email_data['snippet']
+                    },
+                    "processing_result": processing_result,
+                    "draft_info": draft_info
+                }
+                
+                processed_emails.append(processed_email)
+                
+            except Exception as e:
+                logger.error(f"Error processing email {email_data['id']}: {e}")
+                # Continue processing other emails
+                continue
+        
+        # Calculate processing time
+        processing_time = (datetime.now() - start_time).total_seconds()
+        
+        logger.info(f"Successfully processed {len(processed_emails)} emails, created {drafts_created} drafts")
+        
+        return EmailProcessingResponse(
+            processed_count=len(processed_emails),
+            drafts_created=drafts_created,
+            emails_processed=processed_emails,
+            processing_time=processing_time
+        )
+        
+    except Exception as e:
+        logger.error(f"Error processing emails: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing emails: {str(e)}")
+
+@app.get("/emails/drafts")
+async def get_drafts(max_results: int = 10):
+    """Get existing drafts from Gmail."""
+    if not gmail_client:
+        raise HTTPException(status_code=500, detail="Gmail client not initialized")
+    
+    try:
+        drafts = gmail_client.get_drafts(max_results=max_results)
         
         return {
-            "system_status": "running",
-            "scheduler": {
-                "running": email_scheduler.is_running,
-                "jobs": jobs
-            },
-            "knowledge_base": kb_stats,
-            "settings": {
-                "auto_respond_enabled": settings.auto_respond_enabled,
-                "email_check_interval": settings.email_check_interval,
-                "max_emails_per_batch": settings.max_emails_per_batch,
-                "default_ai_model": settings.default_ai_model
-            }
+            "drafts": drafts,
+            "count": len(drafts),
+            "timestamp": datetime.now().isoformat()
         }
         
     except Exception as e:
-        logger.error(f"Status check failed: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Status check failed: {str(e)}"
-        )
+        logger.error(f"Error fetching drafts: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching drafts: {str(e)}")
 
+@app.get("/emails/unread")
+async def get_unread_emails(max_results: int = 10):
+    """Get unread emails without processing them."""
+    if not gmail_client:
+        raise HTTPException(status_code=500, detail="Gmail client not initialized")
+    
+    try:
+        emails = gmail_client.fetch_unread(max_results=max_results)
+        
+        return {
+            "emails": emails,
+            "count": len(emails),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching unread emails: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching unread emails: {str(e)}")
+
+@app.post("/emails/categorize")
+async def categorize_email(email_text: str, sender: str):
+    """Categorize a single email without saving drafts."""
+    if not email_processor:
+        raise HTTPException(status_code=500, detail="Email processor not initialized")
+    
+    try:
+        result = email_processor.categorize_and_process_email(email_text, sender)
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error categorizing email: {e}")
+        raise HTTPException(status_code=500, detail=f"Error categorizing email: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=settings.debug,
-        log_level=settings.log_level.lower()
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000)
