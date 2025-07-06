@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  email-agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - SECRET_KEY=${SECRET_KEY}
+      - DATABASE_URL=sqlite+aiosqlite:///./data/email_agent.db
+      - DEBUG=false
+      - LOG_LEVEL=INFO
+      - EMAIL_CHECK_INTERVAL=300
+      - MAX_EMAILS_PER_BATCH=10
+      - AUTO_RESPOND_ENABLED=true
+      - DEFAULT_AI_MODEL=gpt-4
+      - MAX_RESPONSE_LENGTH=500
+      - TEMPERATURE=0.7
+    volumes:
+      - ./data:/app/data
+      - ./credentials.json:/app/credentials.json
+      - ./knowledge_base:/app/knowledge_base
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  data:
+    driver: local
